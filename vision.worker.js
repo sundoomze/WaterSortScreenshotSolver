@@ -297,7 +297,15 @@ function medianHsv(mat) {
 }
 
 function isFilledSlot(hsv) {
-  const s = hsv[1], v = hsv[2];
+  const h = hsv[0], s = hsv[1], v = hsv[2];
+
+  // Near-white / near-grey pixels are usually glass highlights or the rock pile,
+  // not actual liquid. This prevents the rock bottle from becoming a fake
+  // "very light yellow" color.
+  //
+  // (We keep this conservative to avoid dropping legitimate pastel colors.)
+  if (v >= 175 && s <= 55) return false;
+
   if (v >= 130 && s >= 40) return true;
   if (s >= 150 && v >= 80) return true;
   return false;
@@ -429,6 +437,85 @@ function nmsBoxes(candidates, nmsIou = 0.30) {
   return selected;
 }
 
+function inferBottleFromMouthOutline(cv, roiBgr, offX, offY, fullW, fullH, wMed, hMed) {
+  // Fallback detector: look for the blue outline around the bottle mouth.
+  // This helps when the bottle body outline is too faint to contour-detect
+  // (often the case for empty bottles), but the mouth/neck outline is still visible.
+  try {
+    const hsv = new cv.Mat();
+    cv.cvtColor(roiBgr, hsv, cv.COLOR_BGR2HSV);
+
+    const low = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [85, 8, 55, 0]);
+    const high = new cv.Mat(hsv.rows, hsv.cols, hsv.type(), [140, 255, 255, 255]);
+    const mask = new cv.Mat();
+    cv.inRange(hsv, low, high, mask);
+
+    const k3 = cv.Mat.ones(3, 3, cv.CV_8U);
+    cv.morphologyEx(mask, mask, cv.MORPH_OPEN, k3);
+    cv.dilate(mask, mask, k3);
+
+    const topH = Math.max(1, Math.round(mask.rows * 0.38));
+    const topMask = mask.roi(new cv.Rect(0, 0, mask.cols, topH));
+
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(topMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    let bestRect = null;
+    let bestArea = 0;
+
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      const r = cv.boundingRect(cnt);
+      const rw = r.width, rh = r.height;
+      const area = rw * rh;
+      const ar = rw / (rh + 1e-6);
+
+      // mouth/neck outline is a short, wide-ish shape near the top
+      if (area < 60) { cnt.delete(); continue; }
+      if (ar < 1.4) { cnt.delete(); continue; }
+
+      // Width should be a fraction of the bottle width.
+      if (rw < wMed * 0.30 || rw > wMed * 0.95) { cnt.delete(); continue; }
+      // Height should be relatively small.
+      if (rh < hMed * 0.02 || rh > hMed * 0.22) { cnt.delete(); continue; }
+
+      if (area > bestArea) {
+        bestArea = area;
+        bestRect = r;
+      }
+      cnt.delete();
+    }
+
+    // cleanup
+    contours.delete();
+    hierarchy.delete();
+    topMask.delete();
+    hsv.delete();
+    low.delete();
+    high.delete();
+    mask.delete();
+    k3.delete();
+
+    if (!bestRect) return null;
+
+    const mouthCx = bestRect.x + bestRect.width / 2;
+    const mouthCy = bestRect.y + bestRect.height / 2;
+
+    const absCx = offX + mouthCx;
+    const absCy = offY + mouthCy;
+
+    // Mouth center is near the top of the bottle; place a median-sized bottle box under it.
+    const bx = clampInt(Math.round(absCx - wMed / 2), 0, fullW - 1);
+    const by = clampInt(Math.round(absCy - hMed * 0.10), 0, fullH - 1);
+    const bw = clampInt(Math.round(wMed), 1, fullW - bx);
+    const bh = clampInt(Math.round(hMed), 1, fullH - by);
+    return { x: bx, y: by, w: bw, h: bh, area: bw * bh };
+  } catch (_err) {
+    return null;
+  }
+}
+
 function detectBottleNear(cv, bgr, cx, cy, wMed, hMed) {
   const W = bgr.cols, H = bgr.rows;
   const winW = wMed * 1.9;
@@ -453,9 +540,15 @@ function detectBottleNear(cv, bgr, cx, cy, wMed, hMed) {
     nmsIou: 0.30,
   });
 
-  roi.delete();
+  // If we failed to detect a full bottle contour, try the bottle-mouth fallback
+  // before giving up. This improves reliability on empty bottles.
+  if (!boxes.length) {
+    const mouthBox = inferBottleFromMouthOutline(cv, roi, x0, y0, W, H, wMed, hMed);
+    roi.delete();
+    return mouthBox;
+  }
 
-  if (!boxes.length) return null;
+  roi.delete();
 
   let best = null;
   let bestScore = Infinity;
@@ -492,6 +585,24 @@ function enforceFixedBottleGrid(cv, bgr, candidates) {
     return (cx >= W * 0.20 && cx <= W * 0.80 && cy >= H * 0.14 && cy <= H * 0.85);
   });
   if (filtered.length) boxes = filtered;
+
+  // If we got a bunch of candidates (e.g., stray UI outlines), aggressively
+  // keep only those that look bottle-sized. This prevents false positives
+  // (curtains, banners, etc) from skewing the grid inference.
+  if (boxes.length > EXPECTED) {
+    const areas = boxes.map((b) => b.w * b.h);
+    const medA = medianNumber(areas);
+    const loA = medA * 0.45;
+    const hiA = medA * 2.25;
+    const filteredByArea = boxes.filter((b) => {
+      const a = b.w * b.h;
+      return a >= loA && a <= hiA;
+    });
+    if (filteredByArea.length >= 3) boxes = filteredByArea;
+
+    boxes.sort((a, b) => (b.w * b.h) - (a.w * a.h));
+    if (boxes.length > EXPECTED * 2) boxes = boxes.slice(0, EXPECTED * 2);
+  }
 
   const wMed = boxes.length ? medianNumber(boxes.map((b) => b.w)) : (W * 0.11);
   const hMed = boxes.length ? medianNumber(boxes.map((b) => b.h)) : (H * 0.32);
@@ -731,17 +842,19 @@ function detectRockBottles(cv, bgr, boxes) {
     const s = channels.get(1);
     const v = channels.get(2);
 
-    // rock mask: (s < 80) & (v > 160)
+    // rock mask: low saturation + high value (rocks are light/grey-ish).
+    // Be a bit generous here; we later restrict by position (bottom of bottle)
+    // and by connected-component size.
     const sMask = new cv.Mat();
     const vMask = new cv.Mat();
-    cv.threshold(s, sMask, 80, 255, cv.THRESH_BINARY_INV); // s < 80
-    cv.threshold(v, vMask, 160, 255, cv.THRESH_BINARY);    // v > 160
+    cv.threshold(s, sMask, 110, 255, cv.THRESH_BINARY_INV); // s < 110
+    cv.threshold(v, vMask, 150, 255, cv.THRESH_BINARY);     // v > 150
     const rockMask = new cv.Mat();
     cv.bitwise_and(sMask, vMask, rockMask);
 
     const denom = rockMask.rows * rockMask.cols;
     const ratio = denom > 0 ? (cv.countNonZero(rockMask) / denom) : 0;
-    const isRock = ratio >= 0.10;
+    const isRock = ratio >= 0.06;
     flags.push(isRock);
 
     let rockBox = null;
@@ -797,7 +910,7 @@ function detectRockBottles(cv, bgr, boxes) {
   return { flags, rockBoxes };
 }
 
-function sampleBottleSlots(cv, bgr, boxes, capacity, debugSampling = false) {
+function sampleBottleSlots(cv, bgr, boxes, capacity, rockBoxes = null, debugSampling = false) {
   const hsv = new cv.Mat();
   cv.cvtColor(bgr, hsv, cv.COLOR_BGR2HSV);
 
@@ -833,8 +946,33 @@ function sampleBottleSlots(cv, bgr, boxes, capacity, debugSampling = false) {
       const patchBgr = bgr.roi(rect);
       const patchHsv = hsv.roi(rect);
 
+      // If this patch overlaps the detected rock pile for this bottle, force it to be empty.
+      // This prevents the rock texture (light/desaturated) from getting clustered as a liquid color.
+      let forceEmpty = false;
+      const rb = rockBoxes && rockBoxes[bi];
+      if (rb) {
+        const px = ix;
+        const py = y1;
+        const pw = iw;
+        const ph = Math.max(1, y2 - y1);
+
+        const ix0 = Math.max(px, rb.x);
+        const iy0 = Math.max(py, rb.y);
+        const ix1 = Math.min(px + pw, rb.x + rb.w);
+        const iy1 = Math.min(py + ph, rb.y + rb.h);
+
+        const interW = Math.max(0, ix1 - ix0);
+        const interH = Math.max(0, iy1 - iy0);
+        const inter = interW * interH;
+        if (inter > 0) {
+          const ratio = inter / (pw * ph + 1e-6);
+          if (ratio >= 0.10) forceEmpty = true;
+        }
+      }
+
       const medHsv = medianHsv(patchHsv);
-      const filled = isFilledSlot(medHsv);
+      let filled = isFilledSlot(medHsv);
+      if (forceEmpty) filled = false;
 
       let sampleIdx = null;
       let medBgr = null;
@@ -1154,7 +1292,7 @@ if (!boxes || boxes.length === 0) {
   // 3) slots
   log('step: sample slots');
   const tSlots0 = nowMs();
-  const { bottles, samplesBgr, samplePoints } = sampleBottleSlots(cv, bgr, boxes, capacity, debugSampling);
+  const { bottles, samplesBgr, samplePoints } = sampleBottleSlots(cv, bgr, boxes, capacity, rockBoxes, debugSampling);
   const tSlots1 = nowMs();
 
   // 4) colors
@@ -1163,7 +1301,9 @@ if (!boxes || boxes.length === 0) {
   const { labels: rawLabels, clusterInfo: clusterInfo0 } = clusterColorsDbscan(cv, samplesBgr, dbscanEps);
   const clusters0 = Object.keys(clusterInfo0).length;
 
-  const merged = mergeClustersToExpectedCount(rawLabels, clusterInfo0, cap, dbscanEps);
+  // NOTE: capacity is the per-bottle slot count (typically 4). We use it to infer
+  // the expected number of colors and to safely merge over-split clusters.
+  const merged = mergeClustersToExpectedCount(rawLabels, clusterInfo0, capacity, dbscanEps);
   const labels = merged.labels;
   const clusterInfo = merged.clusterInfo;
 

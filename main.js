@@ -202,7 +202,7 @@ function setLegend(colorsById, labels) {
   legend.innerHTML = '';
   if (legendTitle) {
     const rockCount = (parseResult?.rock_bottles || []).length;
-    legendTitle.textContent = `Colors: ${labels.orderedIds.length} · Rock Bottles: ${rockCount} · (click 2 colors to merge)`;
+    legendTitle.textContent = `Colors: ${labels.orderedIds.length} · Rock Bottles: ${rockCount} · (click 2 colors to merge, × to delete)`;
   }
   const ids = labels.orderedIds;
   for (const id of ids) {
@@ -223,8 +223,20 @@ function setLegend(colorsById, labels) {
     const txt = document.createElement('span');
     txt.textContent = name;
 
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.type = 'button';
+    del.title = 'Remove this color from detection';
+    del.textContent = '×';
+    del.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      clearLegendSelection();
+      deleteDetectedColor(id);
+    });
+
     item.appendChild(sw);
     item.appendChild(txt);
+    item.appendChild(del);
     legend.appendChild(item);
   }
 
@@ -362,6 +374,54 @@ function mergeDetectedColors(keepId, dropId) {
 
   btnSolve.disabled = false;
   setStatus(`Merged colors.`);
+}
+
+function deleteDetectedColor(colorId) {
+  if (!parseResult) return;
+
+  const d = Number(colorId);
+  if (!Number.isFinite(d)) return;
+
+  const colorsById = parseResult.colors_by_id || {};
+  if (!(String(d) in colorsById)) return;
+
+  // Remove from palette
+  delete colorsById[String(d)];
+  if (parseResult.color_unit_counts) delete parseResult.color_unit_counts[String(d)];
+  if (Array.isArray(parseResult.colors)) {
+    parseResult.colors = parseResult.colors.filter((c) => c.id !== d);
+  }
+
+  // Replace occurrences in detected bottles with empty
+  parseResult.bottle_contents_ids = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === d ? null : cid)));
+  parseResult.bottle_contents_hex = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === null || cid === undefined) ? null : (colorsById[String(cid)] || null)));
+
+  // Keep bottles[] in sync (so any downstream consumers don't see a ghost color)
+  if (Array.isArray(parseResult.bottles)) {
+    for (const b of parseResult.bottles) {
+      if (!b?.slots) continue;
+      for (const s of b.slots) {
+        if (s?.color_id === d) {
+          s.filled = false;
+          s.color_id = null;
+          s.color_hex = null;
+        }
+      }
+    }
+  }
+
+  parseResult.num_colors = Object.keys(colorsById).length;
+
+  // Rebuild labels + rerender UI
+  colorLabels = buildColorLabels(colorsById);
+  setLegend(colorsById, colorLabels);
+
+  const cap = parseResult.capacity;
+  const stacks = parseResult.bottle_contents_ids.map((slots) => contentsToStacksTopBottom(slots, cap));
+  renderOutput(stacks, null, null);
+
+  btnSolve.disabled = false;
+  setStatus(`Deleted color.`);
 }
 
 function onLegendItemClick(id) {
