@@ -20,6 +20,14 @@ const solverTitleEl = document.getElementById('solverTitle');
 const solverMetaEl = document.getElementById('solverMeta');
 const movesEl = document.getElementById('moves');
 
+// Manual box controls (bottle + rock)
+const btnEditBottles = document.getElementById('btnEditBottles');
+const btnEditRocks = document.getElementById('btnEditRocks');
+const btnResetBoxes = document.getElementById('btnResetBoxes');
+const btnClearRock = document.getElementById('btnClearRock');
+const boxHintEl = document.getElementById('boxHint');
+const rockLegendEl = document.getElementById('rockLegend');
+
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -41,6 +49,28 @@ let lastDebug = null;
 
 // Legend selection + merge UI
 let legendSelectedId = null;
+
+// --- Manual bottle + rock boxes (6 fixed positions) ---
+const BOX_STORAGE_KEY = 'ws_manual_boxes_v1';
+
+// Absolute (image-space) boxes in pixels.
+let manualBoxes = {
+  bottles: null, // Array<{x,y,w,h}> length 6
+  rocks: null,   // Array<null|{x,y,w,h}> length 6
+};
+
+let editBoxes = {
+  active: false,
+  mode: null, // 'bottles' | 'rocks'
+  selected: null, // { type: 'bottle'|'rock', index: number }
+  action: null, // 'move' | 'resize'
+  handle: null, // 'nw'|'ne'|'se'|'sw'
+  startX: 0,
+  startY: 0,
+  startBox: null,
+};
+
+const canvasWrapEl = document.querySelector('.canvasWrap');
 
 function resetAnalysisLogs() {
   // UI intentionally hides debug logs; keep this as a no-op hook.
@@ -198,12 +228,569 @@ function drawOverlay(debug) {
   }
 }
 
+function redrawOverlay() {
+  if (editBoxes.active) {
+    drawManualOverlay();
+  } else {
+    drawOverlay(lastDebug);
+  }
+}
+
+function clamp(n, lo, hi) {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+function clampBox(box, W, H) {
+  const minW = 12;
+  const minH = 12;
+  const w = clamp(box.w, minW, W);
+  const h = clamp(box.h, minH, H);
+  const x = clamp(box.x, 0, W - w);
+  const y = clamp(box.y, 0, H - h);
+  return { x, y, w, h };
+}
+
+function defaultBottleBoxes(W, H) {
+  // Tuned for the fixed 3x2 layout shown in user examples.
+  const fracW = 0.13;
+  const fracH = 0.34;
+  const xCenters = [0.36, 0.50, 0.64];
+  const yCenters = [0.30, 0.69];
+
+  const bw = Math.round(fracW * W);
+  const bh = Math.round(fracH * H);
+
+  const out = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 3; c++) {
+      const cx = Math.round(xCenters[c] * W);
+      const cy = Math.round(yCenters[r] * H);
+      const b = clampBox({ x: cx - bw / 2, y: cy - bh / 2, w: bw, h: bh }, W, H);
+      out.push(b);
+    }
+  }
+  return out;
+}
+
+function defaultRockBoxes(bottleBoxes) {
+  // Default: only bottom-right (bottle 6) has a rock pile.
+  const out = new Array(6).fill(null);
+  const b = bottleBoxes?.[5];
+  if (b) {
+    out[5] = {
+      x: b.x + b.w * 0.10,
+      y: b.y + b.h * 0.78,
+      w: b.w * 0.80,
+      h: b.h * 0.22,
+    };
+  }
+  return out;
+}
+
+function boxesAbsToRel(boxes, W, H) {
+  if (!Array.isArray(boxes)) return null;
+  return boxes.map((b) => {
+    if (!b) return null;
+    return {
+      x: b.x / W,
+      y: b.y / H,
+      w: b.w / W,
+      h: b.h / H,
+    };
+  });
+}
+
+function boxesRelToAbs(boxes, W, H) {
+  if (!Array.isArray(boxes)) return null;
+  return boxes.map((b) => {
+    if (!b) return null;
+    return clampBox({
+      x: b.x * W,
+      y: b.y * H,
+      w: b.w * W,
+      h: b.h * H,
+    }, W, H);
+  });
+}
+
+function loadBoxesFromStorage(W, H) {
+  try {
+    const raw = localStorage.getItem(BOX_STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!data || data.v !== 1) return null;
+
+    const bottlesRel = data.bottles;
+    const rocksRel = data.rocks;
+    if (!Array.isArray(bottlesRel) || bottlesRel.length !== 6) return null;
+
+    const bottles = boxesRelToAbs(bottlesRel, W, H);
+    const rocks = Array.isArray(rocksRel) && rocksRel.length === 6 ? boxesRelToAbs(rocksRel, W, H) : new Array(6).fill(null);
+
+    return { bottles, rocks };
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveBoxesToStorage(W, H) {
+  try {
+    const payload = {
+      v: 1,
+      bottles: boxesAbsToRel(manualBoxes.bottles, W, H),
+      rocks: boxesAbsToRel(manualBoxes.rocks, W, H),
+    };
+    localStorage.setItem(BOX_STORAGE_KEY, JSON.stringify(payload));
+  } catch (_) {
+    // ignore
+  }
+}
+
+function initManualBoxesForImage(W, H) {
+  const stored = loadBoxesFromStorage(W, H);
+  if (stored?.bottles && stored.bottles.length === 6) {
+    manualBoxes = {
+      bottles: stored.bottles,
+      rocks: (stored.rocks && stored.rocks.length === 6) ? stored.rocks : defaultRockBoxes(stored.bottles),
+    };
+  } else {
+    const bottles = defaultBottleBoxes(W, H);
+    manualBoxes = {
+      bottles,
+      rocks: defaultRockBoxes(bottles),
+    };
+    saveBoxesToStorage(W, H);
+  }
+
+  // Exit edit mode when a new image is loaded.
+  setEditMode(null);
+
+  // Show boxes while editing; otherwise show debug (none yet).
+  redrawOverlay();
+}
+
+function serializeBoxesForWorker(boxes, W, H) {
+  if (!Array.isArray(boxes)) return null;
+  return boxes.map((b) => {
+    if (!b) return null;
+    const bb = clampBox({
+      x: Math.round(b.x),
+      y: Math.round(b.y),
+      w: Math.round(b.w),
+      h: Math.round(b.h),
+    }, W, H);
+    return { x: bb.x, y: bb.y, w: bb.w, h: bb.h };
+  });
+}
+
+function setBoxHint(msg) {
+  if (!boxHintEl) return;
+  boxHintEl.textContent = msg || '';
+}
+
+function setEditMode(mode) {
+  const nextMode = mode || null;
+  const isSame = editBoxes.active && editBoxes.mode === nextMode;
+
+  // Toggle off if clicking the same mode.
+  const active = nextMode && !isSame;
+
+  editBoxes.active = !!active;
+  editBoxes.mode = active ? nextMode : null;
+  editBoxes.selected = null;
+  editBoxes.action = null;
+  editBoxes.handle = null;
+  editBoxes.startBox = null;
+
+  if (canvasWrapEl) {
+    if (editBoxes.active) canvasWrapEl.classList.add('editing');
+    else canvasWrapEl.classList.remove('editing');
+  }
+
+  if (btnEditBottles) btnEditBottles.classList.toggle('active', editBoxes.active && editBoxes.mode === 'bottles');
+  if (btnEditRocks) btnEditRocks.classList.toggle('active', editBoxes.active && editBoxes.mode === 'rocks');
+
+  if (editBoxes.active) {
+    setBoxHint(editBoxes.mode === 'bottles'
+      ? 'Editing bottles: drag to move, corners to resize.'
+      : 'Editing rocks: click inside a bottle to add, drag/resize. Del clears selected rock.');
+  } else {
+    setBoxHint('');
+  }
+
+  redrawOverlay();
+}
+
+function drawHandle(x, y) {
+  const s = 6;
+  octx.fillRect(x - s, y - s, s * 2, s * 2);
+}
+
+function drawManualOverlay() {
+  clearOverlay();
+  if (!manualBoxes.bottles || manualBoxes.bottles.length !== 6) return;
+
+  const sel = editBoxes.selected;
+  const selType = sel?.type || null;
+  const selIdx = (typeof sel?.index === 'number') ? sel.index : null;
+
+  // bottles
+  octx.lineWidth = 3;
+  octx.font = '14px ui-monospace, monospace';
+
+  for (let i = 0; i < manualBoxes.bottles.length; i++) {
+    const b = manualBoxes.bottles[i];
+    const isSel = (selType === 'bottle' && selIdx === i);
+    octx.strokeStyle = isSel ? 'rgba(125, 211, 252, 0.95)' : 'rgba(0, 255, 0, 0.9)';
+    octx.strokeRect(b.x, b.y, b.w, b.h);
+
+    octx.fillStyle = 'rgba(0,0,0,0.55)';
+    octx.fillRect(b.x, Math.max(0, b.y - 20), 54, 20);
+
+    octx.fillStyle = 'rgba(255,255,255,0.95)';
+    octx.fillText(`${i + 1}`, b.x + 6, Math.max(14, b.y - 6));
+  }
+
+  // rocks
+  if (manualBoxes.rocks && manualBoxes.rocks.length === 6) {
+    octx.save();
+    octx.strokeStyle = 'rgba(255, 200, 0, 0.95)';
+    if (typeof octx.setLineDash === 'function') octx.setLineDash([6, 3]);
+    for (let i = 0; i < manualBoxes.rocks.length; i++) {
+      const rb = manualBoxes.rocks[i];
+      if (!rb) continue;
+      const isSel = (selType === 'rock' && selIdx === i);
+      octx.strokeStyle = isSel ? 'rgba(125, 211, 252, 0.95)' : 'rgba(255, 200, 0, 0.95)';
+      octx.strokeRect(rb.x, rb.y, rb.w, rb.h);
+
+      octx.fillStyle = 'rgba(0,0,0,0.55)';
+      octx.fillRect(rb.x, clamp(rb.y + rb.h + 2, 0, overlay.height - 20), 78, 20);
+
+      octx.fillStyle = 'rgba(255,255,255,0.95)';
+      octx.fillText(`ROCK ${i + 1}`, rb.x + 6, clamp(rb.y + rb.h + 16, 14, overlay.height - 6));
+    }
+    octx.restore();
+  }
+
+  // selection handles
+  if (selType && selIdx !== null) {
+    const b = selType === 'bottle' ? manualBoxes.bottles?.[selIdx] : manualBoxes.rocks?.[selIdx];
+    if (b) {
+      octx.save();
+      octx.fillStyle = 'rgba(125, 211, 252, 0.95)';
+      drawHandle(b.x, b.y);
+      drawHandle(b.x + b.w, b.y);
+      drawHandle(b.x + b.w, b.y + b.h);
+      drawHandle(b.x, b.y + b.h);
+      octx.restore();
+    }
+  }
+}
+
+function canvasPointFromEvent(ev) {
+  const rect = overlay.getBoundingClientRect();
+  const sx = overlay.width / rect.width;
+  const sy = overlay.height / rect.height;
+  return {
+    x: (ev.clientX - rect.left) * sx,
+    y: (ev.clientY - rect.top) * sy,
+  };
+}
+
+function pointInBox(p, b) {
+  return p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h;
+}
+
+function getHandleForPoint(p, b) {
+  const hs = 10;
+  const corners = [
+    { h: 'nw', x: b.x, y: b.y },
+    { h: 'ne', x: b.x + b.w, y: b.y },
+    { h: 'se', x: b.x + b.w, y: b.y + b.h },
+    { h: 'sw', x: b.x, y: b.y + b.h },
+  ];
+  for (const c of corners) {
+    const dx = p.x - c.x;
+    const dy = p.y - c.y;
+    if ((dx * dx + dy * dy) <= hs * hs) return c.h;
+  }
+  return null;
+}
+
+function makeDefaultRockBoxForBottle(b) {
+  return {
+    x: b.x + b.w * 0.15,
+    y: b.y + b.h * 0.75,
+    w: b.w * 0.70,
+    h: b.h * 0.22,
+  };
+}
+
+function setSelectedBox(type, index) {
+  editBoxes.selected = { type, index };
+  redrawOverlay();
+}
+
+function clearSelectedRock() {
+  const sel = editBoxes.selected;
+  if (!sel || sel.type !== 'rock' || typeof sel.index !== 'number') return;
+  clearRockForBottle(sel.index);
+  editBoxes.selected = null;
+  redrawOverlay();
+}
+
+function clearRockForBottle(bottleIndex) {
+  if (!lastImageData) return;
+  const W = lastImageData.width;
+  const H = lastImageData.height;
+  if (!manualBoxes.rocks || manualBoxes.rocks.length !== 6) return;
+  const i = Number(bottleIndex);
+  if (!Number.isFinite(i) || i < 0 || i >= 6) return;
+
+  manualBoxes.rocks[i] = null;
+  saveBoxesToStorage(W, H);
+
+  // Update parsed result (so Solve uses the corrected rock set)
+  if (parseResult) {
+    parseResult.rock_bottles = (parseResult.rock_bottles || []).filter((x) => x !== i);
+    if (Array.isArray(parseResult.bottles) && parseResult.bottles[i]) {
+      parseResult.bottles[i].rock = false;
+      parseResult.bottles[i].rock_bbox = null;
+    }
+  }
+
+  // Update debug overlay if present
+  if (lastDebug) {
+    if (Array.isArray(lastDebug.bottles) && lastDebug.bottles[i]) {
+      lastDebug.bottles[i].rock = false;
+    }
+    if (Array.isArray(lastDebug.rockBoxes)) {
+      lastDebug.rockBoxes[i] = null;
+    }
+  }
+
+  if (parseResult) {
+    // Rerender boards + legend title/rock chips
+    if (colorLabels) setLegend(parseResult.colors_by_id || {}, colorLabels);
+    const cap = parseResult.capacity;
+    const stacks = parseResult.bottle_contents_ids.map((slots) => contentsToStacksTopBottom(slots, cap));
+    renderOutput(stacks, null, null);
+    updateSelectionHighlight();
+  }
+
+  redrawOverlay();
+}
+
+function onOverlayPointerDown(ev) {
+  if (!editBoxes.active || !lastImageData) return;
+
+  const p = canvasPointFromEvent(ev);
+  const W = lastImageData.width;
+  const H = lastImageData.height;
+
+  if (editBoxes.mode === 'bottles') {
+    const boxes = manualBoxes.bottles || [];
+    let hit = -1;
+    for (let i = 0; i < boxes.length; i++) {
+      if (boxes[i] && pointInBox(p, boxes[i])) { hit = i; break; }
+    }
+    if (hit < 0) return;
+
+    const b = boxes[hit];
+    const handle = getHandleForPoint(p, b);
+    editBoxes.selected = { type: 'bottle', index: hit };
+    editBoxes.action = handle ? 'resize' : 'move';
+    editBoxes.handle = handle;
+    editBoxes.startX = p.x;
+    editBoxes.startY = p.y;
+    editBoxes.startBox = { ...b };
+
+    try { overlay.setPointerCapture(ev.pointerId); } catch (_) {}
+
+    redrawOverlay();
+    ev.preventDefault();
+    return;
+  }
+
+  if (editBoxes.mode === 'rocks') {
+    const rocks = manualBoxes.rocks || new Array(6).fill(null);
+    const bottles = manualBoxes.bottles || [];
+
+    // Prefer selecting an existing rock box
+    let hit = -1;
+    for (let i = 0; i < rocks.length; i++) {
+      const rb = rocks[i];
+      if (rb && pointInBox(p, rb)) { hit = i; break; }
+    }
+
+    // Otherwise, click inside a bottle to create/select its rock box
+    if (hit < 0) {
+      let bottleHit = -1;
+      for (let i = 0; i < bottles.length; i++) {
+        const b = bottles[i];
+        if (b && pointInBox(p, b)) { bottleHit = i; break; }
+      }
+      if (bottleHit < 0) return;
+
+      hit = bottleHit;
+      if (!rocks[hit]) {
+        rocks[hit] = clampBox(makeDefaultRockBoxForBottle(bottles[hit]), W, H);
+        manualBoxes.rocks = rocks;
+      }
+    }
+
+    const rb = manualBoxes.rocks[hit];
+    if (!rb) return;
+
+    const handle = getHandleForPoint(p, rb);
+    editBoxes.selected = { type: 'rock', index: hit };
+    editBoxes.action = handle ? 'resize' : 'move';
+    editBoxes.handle = handle;
+    editBoxes.startX = p.x;
+    editBoxes.startY = p.y;
+    editBoxes.startBox = { ...rb };
+
+    try { overlay.setPointerCapture(ev.pointerId); } catch (_) {}
+
+    redrawOverlay();
+    ev.preventDefault();
+    return;
+  }
+}
+
+function onOverlayPointerMove(ev) {
+  if (!editBoxes.active || !lastImageData) return;
+  if (!editBoxes.action || !editBoxes.startBox || !editBoxes.selected) return;
+
+  const p = canvasPointFromEvent(ev);
+  const W = lastImageData.width;
+  const H = lastImageData.height;
+  const dx = p.x - editBoxes.startX;
+  const dy = p.y - editBoxes.startY;
+
+  const { type, index } = editBoxes.selected;
+  const targetArr = (type === 'bottle') ? manualBoxes.bottles : manualBoxes.rocks;
+  if (!targetArr || !targetArr[index]) return;
+
+  let b = { ...editBoxes.startBox };
+
+  if (editBoxes.action === 'move') {
+    b.x = editBoxes.startBox.x + dx;
+    b.y = editBoxes.startBox.y + dy;
+  } else if (editBoxes.action === 'resize') {
+    const h = editBoxes.handle;
+    if (h === 'nw') {
+      b.x = editBoxes.startBox.x + dx;
+      b.y = editBoxes.startBox.y + dy;
+      b.w = editBoxes.startBox.w - dx;
+      b.h = editBoxes.startBox.h - dy;
+    } else if (h === 'ne') {
+      b.y = editBoxes.startBox.y + dy;
+      b.w = editBoxes.startBox.w + dx;
+      b.h = editBoxes.startBox.h - dy;
+    } else if (h === 'se') {
+      b.w = editBoxes.startBox.w + dx;
+      b.h = editBoxes.startBox.h + dy;
+    } else if (h === 'sw') {
+      b.x = editBoxes.startBox.x + dx;
+      b.w = editBoxes.startBox.w - dx;
+      b.h = editBoxes.startBox.h + dy;
+    }
+  }
+
+  b = clampBox(b, W, H);
+
+  targetArr[index] = b;
+  if (type === 'rock') manualBoxes.rocks = targetArr;
+  if (type === 'bottle') manualBoxes.bottles = targetArr;
+
+  redrawOverlay();
+  ev.preventDefault();
+}
+
+function onOverlayPointerUp(ev) {
+  if (!editBoxes.active || !lastImageData) return;
+  if (!editBoxes.action) return;
+
+  try { overlay.releasePointerCapture(ev.pointerId); } catch (_) {}
+
+  editBoxes.action = null;
+  editBoxes.handle = null;
+  editBoxes.startBox = null;
+
+  saveBoxesToStorage(lastImageData.width, lastImageData.height);
+  redrawOverlay();
+  ev.preventDefault();
+}
+
+function onOverlayKeyDown(ev) {
+  if (!editBoxes.active) return;
+  if (editBoxes.mode !== 'rocks') return;
+  if (ev.key === 'Delete' || ev.key === 'Backspace') {
+    clearSelectedRock();
+    ev.preventDefault();
+  }
+}
+
+function renderRockLegend() {
+  if (!rockLegendEl) return;
+  rockLegendEl.innerHTML = '';
+
+  const rocks = parseResult?.rock_bottles || [];
+  if (!Array.isArray(rocks) || rocks.length === 0) {
+    rockLegendEl.style.display = 'none';
+    return;
+  }
+
+  rockLegendEl.style.display = 'flex';
+
+  for (const idx of rocks) {
+    const bi = Number(idx);
+    if (!Number.isFinite(bi)) continue;
+
+    const item = document.createElement('div');
+    item.className = 'item';
+    item.dataset.bottle = String(bi);
+
+    const sw = document.createElement('div');
+    sw.className = 'swatch';
+    sw.style.background = 'rgba(255, 200, 0, 0.95)';
+    item.appendChild(sw);
+
+    const label = document.createElement('div');
+    label.textContent = `Rock bottle ${bi + 1}`;
+    item.appendChild(label);
+
+    // Clicking the chip jumps to rock edit mode for that bottle (handy to nudge the box)
+    item.addEventListener('click', () => {
+      if (!(editBoxes.active && editBoxes.mode === 'rocks')) setEditMode('rocks');
+      if (manualBoxes.rocks?.[bi]) {
+        setSelectedBox('rock', bi);
+      }
+    });
+
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.type = 'button';
+    del.title = 'Remove rock from this bottle';
+    del.textContent = '×';
+    del.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      clearRockForBottle(bi);
+    });
+    item.appendChild(del);
+
+    rockLegendEl.appendChild(item);
+  }
+}
+
 function setLegend(colorsById, labels) {
   legend.innerHTML = '';
   if (legendTitle) {
     const rockCount = (parseResult?.rock_bottles || []).length;
     legendTitle.textContent = `Colors: ${labels.orderedIds.length} · Rock Bottles: ${rockCount} · (click 2 colors to merge, × to delete)`;
   }
+  renderRockLegend();
   const ids = labels.orderedIds;
   for (const id of ids) {
     const hex = colorsById[String(id)];
@@ -224,12 +811,13 @@ function setLegend(colorsById, labels) {
     txt.textContent = name;
 
     const del = document.createElement('button');
-    del.type = 'button';
     del.className = 'del';
+    del.type = 'button';
+    del.title = 'Remove this color from detection';
     del.textContent = '×';
-    del.title = 'Delete this color from detection';
     del.addEventListener('click', (ev) => {
       ev.stopPropagation();
+      clearLegendSelection();
       deleteDetectedColor(id);
     });
 
@@ -375,46 +963,35 @@ function mergeDetectedColors(keepId, dropId) {
   setStatus(`Merged colors.`);
 }
 
-function deleteDetectedColor(id) {
+function deleteDetectedColor(colorId) {
   if (!parseResult) return;
 
-  const cid = Number(id);
-  if (!Number.isFinite(cid)) return;
+  const d = Number(colorId);
+  if (!Number.isFinite(d)) return;
 
   const colorsById = parseResult.colors_by_id || {};
-  if (!(String(cid) in colorsById)) return;
+  if (!(String(d) in colorsById)) return;
 
-  // Clear legend selection if it points to this color.
-  if (legendSelectedId === cid) clearLegendSelection();
-
-  // Remove the color definition
-  delete colorsById[String(cid)];
-  if (parseResult.color_unit_counts) delete parseResult.color_unit_counts[String(cid)];
-
+  // Remove from palette
+  delete colorsById[String(d)];
+  if (parseResult.color_unit_counts) delete parseResult.color_unit_counts[String(d)];
   if (Array.isArray(parseResult.colors)) {
-    parseResult.colors = parseResult.colors.filter((c) => c.id !== cid);
+    parseResult.colors = parseResult.colors.filter((c) => c.id !== d);
   }
 
-  // Replace occurrences in detected bottles with empty slots.
-  parseResult.bottle_contents_ids = (parseResult.bottle_contents_ids || []).map((b) =>
-    b.map((v) => (v === cid ? null : v))
-  );
+  // Replace occurrences in detected bottles with empty
+  parseResult.bottle_contents_ids = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === d ? null : cid)));
+  parseResult.bottle_contents_hex = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === null || cid === undefined) ? null : (colorsById[String(cid)] || null)));
 
-  // Rebuild hex contents
-  parseResult.bottle_contents_hex = (parseResult.bottle_contents_ids || []).map((b) =>
-    b.map((v) => (v === null || v === undefined) ? null : (colorsById[String(v)] || null))
-  );
-
-  // Keep bottles[] in sync
+  // Keep bottles[] in sync (so any downstream consumers don't see a ghost color)
   if (Array.isArray(parseResult.bottles)) {
     for (const b of parseResult.bottles) {
       if (!b?.slots) continue;
       for (const s of b.slots) {
-        if (!s?.filled) continue;
-        if (s.color_id === cid) {
+        if (s?.color_id === d) {
+          s.filled = false;
           s.color_id = null;
           s.color_hex = null;
-          s.filled = false;
         }
       }
     }
@@ -431,7 +1008,7 @@ function deleteDetectedColor(id) {
   renderOutput(stacks, null, null);
 
   btnSolve.disabled = false;
-  setStatus('Deleted color from detection.');
+  setStatus(`Deleted color.`);
 }
 
 function onLegendItemClick(id) {
@@ -725,7 +1302,7 @@ async function onVisionResult(result, debug) {
   colorLabels = buildColorLabels(result.colors_by_id || {});
   setLegend(result.colors_by_id || {}, colorLabels);
 
-  drawOverlay(debug);
+  redrawOverlay();
 
   // Convert parsed contents -> stacks bottom->top
   const cap = parseResult.capacity;
@@ -972,11 +1549,34 @@ function resetState() {
   lastImageData = null;
   parseResult = null;
   colorLabels = null;
+
+  // Reset manual boxes per-image; we'll re-initialize after loading a screenshot.
+  manualBoxes = { bottles: null, rocks: null };
+  editBoxes = {
+    active: false,
+    mode: null,
+    selected: null,
+    action: null,
+    handle: null,
+    startX: 0,
+    startY: 0,
+    startBox: null,
+  };
+  if (canvasWrapEl) canvasWrapEl.classList.remove('editing');
+
   btnAnalyze.disabled = true;
   btnSolve.disabled = true;
+
+  if (btnEditBottles) btnEditBottles.disabled = true;
+  if (btnEditRocks) btnEditRocks.disabled = true;
+  if (btnResetBoxes) btnResetBoxes.disabled = true;
+  if (btnClearRock) btnClearRock.disabled = true;
+  if (boxHintEl) boxHintEl.textContent = '';
+
   clearOverlay();
   legend.innerHTML = '';
   if (legendTitle) legendTitle.textContent = 'Colors: — · Rock Bottles: —';
+  if (rockLegendEl) rockLegendEl.innerHTML = '';
   if (boardDetectedEl) boardDetectedEl.innerHTML = '';
   if (boardFinalEl) boardFinalEl.innerHTML = '';
   if (solverTitleEl) solverTitleEl.textContent = 'Solver';
@@ -997,6 +1597,14 @@ async function loadImageFromFile(file) {
 
   ctx.drawImage(bmp, 0, 0);
   lastImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  // Initialize manual boxes (6 fixed positions) for this image size.
+  initManualBoxesForImage(bmp.width, bmp.height);
+
+  if (btnEditBottles) btnEditBottles.disabled = false;
+  if (btnEditRocks) btnEditRocks.disabled = false;
+  if (btnResetBoxes) btnResetBoxes.disabled = false;
+  if (btnClearRock) btnClearRock.disabled = false;
 
   btnAnalyze.disabled = false;
   setStatus(`Loaded ${file.name} (${bmp.width}×${bmp.height}). Click Analyze.`);
@@ -1032,6 +1640,8 @@ async function analyze() {
     width: lastImageData.width,
     height: lastImageData.height,
     rgba: rgbaCopy.buffer,
+    manualBottleBoxes: serializeBoxesForWorker(manualBoxes.bottles, lastImageData.width, lastImageData.height),
+    manualRockBoxes: serializeBoxesForWorker(manualBoxes.rocks, lastImageData.width, lastImageData.height),
     capacity: 4,
     dbscanEps: eps,
     cvVer,
@@ -1047,4 +1657,33 @@ elFile.addEventListener('change', async () => {
 
 btnAnalyze.addEventListener('click', analyze);
 btnSolve.addEventListener('click', solveAndRender);
+
+// Manual box editing
+if (btnEditBottles) btnEditBottles.addEventListener('click', () => setEditMode('bottles'));
+if (btnEditRocks) btnEditRocks.addEventListener('click', () => setEditMode('rocks'));
+
+if (btnResetBoxes) btnResetBoxes.addEventListener('click', () => {
+  if (!lastImageData) return;
+  const W = lastImageData.width;
+  const H = lastImageData.height;
+  const bottles = defaultBottleBoxes(W, H);
+  manualBoxes = { bottles, rocks: defaultRockBoxes(bottles) };
+  saveBoxesToStorage(W, H);
+  // Keep edit mode off after a reset (prevents accidental drags)
+  setEditMode(null);
+  redrawOverlay();
+});
+
+if (btnClearRock) btnClearRock.addEventListener('click', () => clearSelectedRock());
+
+// Pointer handlers (only active when the overlay is in edit mode via CSS)
+if (overlay) {
+  try { overlay.style.touchAction = 'none'; } catch (_) {}
+  overlay.addEventListener('pointerdown', onOverlayPointerDown);
+  overlay.addEventListener('pointermove', onOverlayPointerMove);
+}
+
+// Use window-level pointerup so drags don't get "stuck" when releasing outside the overlay
+window.addEventListener('pointerup', onOverlayPointerUp, true);
+window.addEventListener('keydown', onOverlayKeyDown);
 

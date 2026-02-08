@@ -27,6 +27,14 @@
         <button id="btnAnalyze" disabled>Analyze</button>
         <button id="btnSolve" disabled>Solve</button>
       </div>
+
+      <div class="row wrap" style="margin-top:10px;">
+        <button id="btnEditBottles" disabled>Edit Bottles</button>
+        <button id="btnEditRocks" disabled>Edit Rocks</button>
+        <button id="btnResetBoxes" disabled>Reset Boxes</button>
+        <button id="btnClearRock" disabled>Clear Selected Rock</button>
+        <span id="boxHint" class="subtle" style="font-size:12px;"></span>
+      </div>
     </section>
 
     <section class="panel workspace">
@@ -41,6 +49,7 @@
 
           <div class="detectedPane">
             <div id="legendTitle" class="detectedSummary">Colors: — · Rock Bottles: —</div>
+            <div id="rockLegend" class="legend"></div>
             <div id="legend" class="legend"></div>
             <div id="boardDetected" class="board"></div>
           </div>
