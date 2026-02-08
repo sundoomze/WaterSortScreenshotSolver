@@ -35,6 +35,13 @@ let visionWorkerCvVer = null;
 
 let isAnalyzing = false;
 
+let analyzeRequestId = 0;
+let activeAnalyzeRequestId = 0;
+let lastDebug = null;
+
+// Legend selection + merge UI
+let legendSelectedId = null;
+
 function resetAnalysisLogs() {
   // UI intentionally hides debug logs; keep this as a no-op hook.
 }
@@ -50,43 +57,53 @@ function setStatus(msg) {
 function ensureVisionWorker(cvVer) {
   if (visionWorker && visionWorkerCvVer === cvVer) return visionWorker;
 
+  // If we already have a worker (different cv version or previously crashed),
+  // tear it down so we can start clean.
   if (visionWorker) {
-    visionWorker.terminate();
+    try { visionWorker.terminate(); } catch (_) {}
     visionWorker = null;
   }
 
   visionWorkerCvVer = cvVer;
-
   visionWorker = new Worker('./vision.worker.js');
+
+  const hardReset = (statusMsg) => {
+    try { visionWorker?.terminate(); } catch (_) {}
+    visionWorker = null;
+    visionWorkerCvVer = null;
+    isAnalyzing = false;
+    btnAnalyze.disabled = false;
+    btnSolve.disabled = true;
+    setStatus(statusMsg);
+  };
 
   // If the worker throws (e.g., importScripts fails, CORS blocked, syntax error),
   // it will NOT send us a postMessage. It will land here.
   visionWorker.onerror = (err) => {
     console.error('[vision worker error event]', err);
-    setStatus(`Vision worker crashed: ${err?.message || err}`);
-    isAnalyzing = false;
-    btnAnalyze.disabled = false;
-    btnSolve.disabled = true;
+    hardReset(`Vision worker crashed: ${err?.message || err}`);
   };
 
   visionWorker.onmessageerror = (err) => {
     console.error('[vision worker message error]', err);
-    setStatus('Vision worker message error (structured clone failed).');
-    isAnalyzing = false;
-    btnAnalyze.disabled = false;
-    btnSolve.disabled = true;
+    hardReset('Vision worker message error (structured clone failed).');
   };
 
   visionWorker.onmessage = (e) => {
-    const { type } = e.data || {};
+    const data = e.data || {};
+    const { type, requestId } = data;
+
+    // Ignore stale messages (e.g., from a previous analysis run that finished late).
+    if (typeof requestId === 'number' && requestId !== activeAnalyzeRequestId) return;
+
     if (type === 'log') {
-      console.log('[vision]', e.data.message);
-      pushAnalysisLog(String(e.data.message || ''));
+      console.log('[vision]', data.message);
+      pushAnalysisLog(String(data.message || ''));
       return;
     }
     if (type === 'error') {
-      console.error(e.data.error);
-      setStatus(`Vision worker error: ${e.data.error}`);
+      console.error(data.error);
+      setStatus(`Vision worker error: ${data.error}`);
       isAnalyzing = false;
       // allow retry without reloading the image
       btnAnalyze.disabled = false;
@@ -94,10 +111,11 @@ function ensureVisionWorker(cvVer) {
       return;
     }
     if (type === 'result') {
-      onVisionResult(e.data.result, e.data.debug);
+      onVisionResult(data.result, data.debug);
       return;
     }
   };
+
   return visionWorker;
 }
 
@@ -184,7 +202,7 @@ function setLegend(colorsById, labels) {
   legend.innerHTML = '';
   if (legendTitle) {
     const rockCount = (parseResult?.rock_bottles || []).length;
-    legendTitle.textContent = `Colors: ${labels.orderedIds.length} · Rock Bottles: ${rockCount}`;
+    legendTitle.textContent = `Colors: ${labels.orderedIds.length} · Rock Bottles: ${rockCount} · (click 2 colors to merge)`;
   }
   const ids = labels.orderedIds;
   for (const id of ids) {
@@ -194,7 +212,9 @@ function setLegend(colorsById, labels) {
 
     const item = document.createElement('div');
     item.className = 'item';
+    item.dataset.cid = String(id);
     item.title = `${abbr} (${hex})`;
+    item.addEventListener('click', () => onLegendItemClick(id));
 
     const sw = document.createElement('span');
     sw.className = 'swatch';
@@ -207,6 +227,170 @@ function setLegend(colorsById, labels) {
     item.appendChild(txt);
     legend.appendChild(item);
   }
+
+  updateSelectionHighlight();
+}
+
+function updateSelectionHighlight() {
+  const sel = (typeof legendSelectedId === 'number') ? legendSelectedId : null;
+
+  // Legend items
+  legend.querySelectorAll('.item').forEach((el) => {
+    const cid = parseInt(el.dataset.cid || '-1', 10);
+    if (sel !== null && cid === sel) el.classList.add('selected');
+    else el.classList.remove('selected');
+  });
+
+  // Board slots (both detected + final boards)
+  const slots = document.querySelectorAll('.slot');
+  slots.forEach((el) => {
+    const cidStr = el.dataset.cid;
+    const cid = (cidStr === undefined || cidStr === null || cidStr === '') ? null : parseInt(cidStr, 10);
+    if (sel !== null && cid === sel) el.classList.add('selectedColor');
+    else el.classList.remove('selectedColor');
+  });
+}
+
+function clearLegendSelection() {
+  legendSelectedId = null;
+  updateSelectionHighlight();
+}
+
+function hexToRgb(hex) {
+  const h = String(hex || '').replace('#', '').trim();
+  if (h.length !== 6) return { r: 0, g: 0, b: 0 };
+  return {
+    r: parseInt(h.slice(0, 2), 16),
+    g: parseInt(h.slice(2, 4), 16),
+    b: parseInt(h.slice(4, 6), 16),
+  };
+}
+
+function bgrToHex(b, g, r) {
+  const rr = Math.max(0, Math.min(255, Math.round(r)));
+  const gg = Math.max(0, Math.min(255, Math.round(g)));
+  const bb = Math.max(0, Math.min(255, Math.round(b)));
+  return '#' + rr.toString(16).padStart(2, '0').toUpperCase()
+           + gg.toString(16).padStart(2, '0').toUpperCase()
+           + bb.toString(16).padStart(2, '0').toUpperCase();
+}
+
+function mergeDetectedColors(keepId, dropId) {
+  if (!parseResult) return;
+  const colorsById = parseResult.colors_by_id || {};
+
+  const k = Number(keepId);
+  const d = Number(dropId);
+  if (!Number.isFinite(k) || !Number.isFinite(d) || k === d) return;
+  if (!(String(k) in colorsById) || !(String(d) in colorsById)) return;
+
+  const counts = parseResult.color_unit_counts || {};
+  const cK = (counts[String(k)] ?? 0) | 0;
+  const cD = (counts[String(d)] ?? 0) | 0;
+  const total = cK + cD;
+
+  // Pull BGR from the worker's cluster info if present; otherwise fall back to hex.
+  const infoK = Array.isArray(parseResult.colors) ? parseResult.colors.find((c) => c.id === k) : null;
+  const infoD = Array.isArray(parseResult.colors) ? parseResult.colors.find((c) => c.id === d) : null;
+
+  const bgrK = infoK?.center_bgr ? infoK.center_bgr : (() => {
+    const { r, g, b } = hexToRgb(colorsById[String(k)]);
+    return [b, g, r];
+  })();
+
+  const bgrD = infoD?.center_bgr ? infoD.center_bgr : (() => {
+    const { r, g, b } = hexToRgb(colorsById[String(d)]);
+    return [b, g, r];
+  })();
+
+  const wK = total > 0 ? cK / total : 0.5;
+  const wD = total > 0 ? cD / total : 0.5;
+
+  const mb = bgrK[0] * wK + bgrD[0] * wD;
+  const mg = bgrK[1] * wK + bgrD[1] * wD;
+  const mr = bgrK[2] * wK + bgrD[2] * wD;
+
+  const mergedHex = bgrToHex(mb, mg, mr);
+
+  // --- Update parseResult ---
+  colorsById[String(k)] = mergedHex;
+  delete colorsById[String(d)];
+
+  if (parseResult.color_unit_counts) {
+    parseResult.color_unit_counts[String(k)] = total;
+    delete parseResult.color_unit_counts[String(d)];
+  }
+
+  if (Array.isArray(parseResult.colors)) {
+    // update keep entry
+    if (infoK) {
+      infoK.count = total;
+      infoK.center_bgr = [mb, mg, mr];
+      infoK.center_hex = mergedHex;
+    }
+    // drop
+    parseResult.colors = parseResult.colors.filter((c) => c.id !== d);
+  }
+
+  // Replace ids in detected bottles
+  parseResult.bottle_contents_ids = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === d ? k : cid)));
+
+  // Rebuild hex contents
+  parseResult.bottle_contents_hex = (parseResult.bottle_contents_ids || []).map((b) => b.map((cid) => (cid === null || cid === undefined) ? null : (colorsById[String(cid)] || null)));
+
+  // Keep bottles[] in sync for downstream debug consumers
+  if (Array.isArray(parseResult.bottles)) {
+    for (const b of parseResult.bottles) {
+      if (!b?.slots) continue;
+      for (const s of b.slots) {
+        if (!s?.filled) continue;
+        if (s.color_id === d) s.color_id = k;
+        if (s.color_id === k) s.color_hex = colorsById[String(k)] || s.color_hex;
+      }
+    }
+  }
+
+  parseResult.num_colors = Object.keys(colorsById).length;
+
+  // Rebuild labels + rerender UI
+  colorLabels = buildColorLabels(colorsById);
+  setLegend(colorsById, colorLabels);
+
+  const cap = parseResult.capacity;
+  const stacks = parseResult.bottle_contents_ids.map((slots) => contentsToStacksTopBottom(slots, cap));
+  renderOutput(stacks, null, null);
+
+  btnSolve.disabled = false;
+  setStatus(`Merged colors.`);
+}
+
+function onLegendItemClick(id) {
+  if (!parseResult) return;
+
+  const cid = Number(id);
+  if (!Number.isFinite(cid)) return;
+
+  // 1st click selects
+  if (legendSelectedId === null || legendSelectedId === undefined) {
+    legendSelectedId = cid;
+    updateSelectionHighlight();
+    const cname = (colorLabels?.namesById?.[cid]) || (`Color ${cid}`);
+    setStatus(`Selected ${cname}. Click another color to merge.`);
+    return;
+  }
+
+  // Click same again to clear
+  if (legendSelectedId === cid) {
+    clearLegendSelection();
+    setStatus('Selection cleared.');
+    return;
+  }
+
+  // 2nd click merges into the first selection (keep = first click)
+  const keepId = legendSelectedId;
+  const dropId = cid;
+  clearLegendSelection();
+  mergeDetectedColors(keepId, dropId);
 }
 
 function cellText(abbr) {
@@ -334,6 +518,7 @@ function renderBoardEl(container, contentsTopBottomByBottle, layoutRows, cap, ro
         const cid = contents[si];
         const slot = document.createElement('div');
         slot.className = 'slot';
+        slot.dataset.cid = (cid === null || cid === undefined) ? '' : String(cid);
         if (cid === null || cid === undefined) {
           slot.classList.add('empty');
         } else {
@@ -464,6 +649,8 @@ async function onVisionResult(result, debug) {
   isAnalyzing = false;
 
   parseResult = result;
+  lastDebug = debug;
+  clearLegendSelection();
 
   colorLabels = buildColorLabels(result.colors_by_id || {});
   setLegend(result.colors_by_id || {}, colorLabels);
@@ -475,6 +662,7 @@ async function onVisionResult(result, debug) {
   const stacks = parseResult.bottle_contents_ids.map((slots) => contentsToStacksTopBottom(slots, cap));
 
   renderOutput(stacks, null, null);
+  updateSelectionHighlight();
 
   // Allow re-running analysis.
   btnAnalyze.disabled = false;
@@ -742,10 +930,13 @@ async function loadImageFromFile(file) {
 
   btnAnalyze.disabled = false;
   setStatus(`Loaded ${file.name} (${bmp.width}×${bmp.height}). Click Analyze.`);
+  // Allow picking the same file again (some browsers don't fire change if the value is unchanged)
+  try { elFile.value = ''; } catch (_) {}
 }
 
 async function analyze() {
   if (!imageBitmap || !lastImageData) return;
+  if (isAnalyzing) return;
 
   btnAnalyze.disabled = true;
   btnSolve.disabled = true;
@@ -756,12 +947,18 @@ async function analyze() {
   const cvVer = DEFAULT_CV_VER;
   const eps = DEFAULT_DBSCAN_EPS;
 
+  // Tag this analysis run so late worker messages from older runs are ignored.
+  const requestId = ++analyzeRequestId;
+  activeAnalyzeRequestId = requestId;
+  clearLegendSelection();
+
   const worker = ensureVisionWorker(cvVer);
 
   // Copy buffer so we keep lastImageData available for OCR cropping
   const rgbaCopy = new Uint8ClampedArray(lastImageData.data);
   worker.postMessage({
     type: 'analyze',
+    requestId,
     width: lastImageData.width,
     height: lastImageData.height,
     rgba: rgbaCopy.buffer,

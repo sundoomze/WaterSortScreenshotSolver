@@ -13,9 +13,11 @@
 
 let cvPromise = null;
 let cvVersionLoaded = null;
+let currentRequestId = null;
+let isBusy = false;
 
 function log(message) {
-  self.postMessage({ type: 'log', message });
+  self.postMessage({ type: 'log', requestId: currentRequestId, message });
 }
 
 
@@ -368,6 +370,333 @@ function detectBottles(cv, bgr, hsvLower, hsvUpper, opts) {
   return { boxes: ordered, rows: rows.map((r) => r.boxes.map((b) => ordered.indexOf(b))) };
 }
 
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function medianNumber(arr) {
+  if (!arr || arr.length === 0) return 0;
+  const a = arr.slice().sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return (a.length % 2) ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+function kmeans1D(values, k, iters = 10) {
+  // Returns `k` centers (sorted). Assumes values.length >= k.
+  const n = values.length;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const centers = [];
+  for (let i = 0; i < k; i++) {
+    const q = (i + 0.5) / k;
+    centers.push(sorted[Math.floor(q * (n - 1))]);
+  }
+
+  for (let t = 0; t < iters; t++) {
+    const groups = Array.from({ length: k }, () => []);
+    for (const v of values) {
+      let best = 0;
+      let bestDist = Infinity;
+      for (let i = 0; i < k; i++) {
+        const d = Math.abs(v - centers[i]);
+        if (d < bestDist) { bestDist = d; best = i; }
+      }
+      groups[best].push(v);
+    }
+
+    for (let i = 0; i < k; i++) {
+      if (groups[i].length) {
+        centers[i] = groups[i].reduce((s, v) => s + v, 0) / groups[i].length;
+      }
+    }
+  }
+
+  centers.sort((a, b) => a - b);
+  return centers;
+}
+
+function nmsBoxes(candidates, nmsIou = 0.30) {
+  const boxes = (candidates || []).map((b) => ({ ...b, area: b.area ?? (b.w * b.h) }));
+  boxes.sort((a, b) => (b.area ?? 0) - (a.area ?? 0));
+
+  const selected = [];
+  for (const c of boxes) {
+    let ok = true;
+    for (const s of selected) {
+      if (iou(c, s) >= nmsIou) { ok = false; break; }
+    }
+    if (ok) selected.push(c);
+  }
+  return selected;
+}
+
+function detectBottleNear(cv, bgr, cx, cy, wMed, hMed) {
+  const W = bgr.cols, H = bgr.rows;
+  const winW = wMed * 1.9;
+  const winH = hMed * 1.9;
+
+  const x0 = clampInt(Math.round(cx - winW / 2), 0, W - 1);
+  const y0 = clampInt(Math.round(cy - winH / 2), 0, H - 1);
+  const w0 = clampInt(Math.round(winW), 1, W - x0);
+  const h0 = clampInt(Math.round(winH), 1, H - y0);
+
+  const roi = bgr.roi(new cv.Rect(x0, y0, w0, h0));
+  // Dark + bright outline pass (the fixed layout lets us be aggressive here).
+  const lower = [85, 5, 35];
+  const upper = [140, 255, 255];
+
+  const minArea = Math.max(2000, (wMed * hMed) * 0.20);
+
+  const { boxes } = detectBottles(cv, roi, lower, upper, {
+    minArea,
+    aspectMin: 2.0,
+    aspectMax: 6.5,
+    nmsIou: 0.30,
+  });
+
+  roi.delete();
+
+  if (!boxes.length) return null;
+
+  let best = null;
+  let bestScore = Infinity;
+  for (const b of boxes) {
+    const bx = b.x + x0;
+    const by = b.y + y0;
+    const bcX = bx + b.w / 2;
+    const bcY = by + b.h / 2;
+    const dist = Math.hypot(bcX - cx, bcY - cy);
+
+    const sizePenalty = Math.abs((b.w * b.h) - (wMed * hMed)) / (wMed * hMed + 1e-6);
+    const score = dist + sizePenalty * (wMed * 0.35);
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = { x: bx, y: by, w: b.w, h: b.h, area: b.w * b.h };
+    }
+  }
+
+  return best;
+}
+
+function enforceFixedBottleGrid(cv, bgr, candidates) {
+  // This game layout never changes: 3 bottles on the top row + 3 on the bottom row.
+  const W = bgr.cols, H = bgr.rows;
+  const EXPECTED = 6;
+
+  let boxes = (candidates || []).slice();
+
+  // Filter out obvious junk (curtains / bottom UI) by position.
+  const filtered = boxes.filter((b) => {
+    const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2;
+    return (cx >= W * 0.20 && cx <= W * 0.80 && cy >= H * 0.14 && cy <= H * 0.85);
+  });
+  if (filtered.length) boxes = filtered;
+
+  const wMed = boxes.length ? medianNumber(boxes.map((b) => b.w)) : (W * 0.11);
+  const hMed = boxes.length ? medianNumber(boxes.map((b) => b.h)) : (H * 0.32);
+
+  // Estimate spacing
+  const xs = boxes.map((b) => b.x + b.w / 2);
+  const ys = boxes.map((b) => b.y + b.h / 2);
+
+  let dx = wMed * 1.60;
+  if (xs.length >= 2) {
+    const sx = xs.slice().sort((a, b) => a - b);
+    const diffs = [];
+    for (let i = 1; i < sx.length; i++) {
+      const d = sx[i] - sx[i - 1];
+      if (d >= wMed * 0.6) diffs.push(d);
+    }
+    if (diffs.length) dx = medianNumber(diffs);
+  }
+
+  let dy = Math.max(hMed * 1.25, H * 0.25);
+  if (ys.length >= 2) {
+    const centers = kmeans1D(ys, 2, 8);
+    const sep = Math.abs(centers[1] - centers[0]);
+    if (sep >= hMed * 0.8) dy = sep;
+  }
+
+  // X centers (3 cols)
+  let xCenters;
+  if (xs.length >= 3) {
+    xCenters = kmeans1D(xs, 3, 10);
+  } else if (xs.length === 2) {
+    const sx = xs.slice().sort((a, b) => a - b);
+    const x1 = sx[0], x2 = sx[1];
+    const diff = x2 - x1;
+
+    if (diff > dx * 1.6) {
+      const step = diff / 2;
+      xCenters = [x1, x1 + step, x1 + 2 * step];
+      dx = step;
+    } else {
+      // adjacent
+      if (x1 < W / 2) xCenters = [x1, x2, x2 + diff];
+      else xCenters = [x1 - diff, x1, x2];
+      dx = diff;
+    }
+  } else if (xs.length === 1) {
+    const x = xs[0];
+    const col = (x < W * 0.45) ? 0 : (x > W * 0.55) ? 2 : 1;
+    if (col === 0) xCenters = [x, x + dx, x + 2 * dx];
+    else if (col === 1) xCenters = [x - dx, x, x + dx];
+    else xCenters = [x - 2 * dx, x - dx, x];
+  } else {
+    xCenters = [W * 0.38, W * 0.50, W * 0.62];
+    dx = (xCenters[1] - xCenters[0]);
+  }
+  xCenters = xCenters.map((v) => clamp(v, wMed * 0.6, W - wMed * 0.6)).sort((a, b) => a - b);
+
+  // Y centers (2 rows)
+  let yCenters;
+  if (ys.length >= 2) {
+    const centers = kmeans1D(ys, 2, 10);
+    const sep = Math.abs(centers[1] - centers[0]);
+    if (sep < hMed * 0.8) {
+      // Probably only one row detected; infer the other.
+      const y0 = centers[0];
+      if (y0 < H / 2) yCenters = [y0, y0 + dy];
+      else yCenters = [y0 - dy, y0];
+    } else {
+      yCenters = centers;
+    }
+  } else if (ys.length === 1) {
+    const y = ys[0];
+    const row = (y < H / 2) ? 0 : 1;
+    if (row === 0) yCenters = [y, y + dy];
+    else yCenters = [y - dy, y];
+  } else {
+    yCenters = [H * 0.33, H * 0.65];
+    dy = yCenters[1] - yCenters[0];
+  }
+  yCenters = yCenters.map((v) => clamp(v, hMed * 0.6, H - hMed * 0.6)).sort((a, b) => a - b);
+
+  // Grid predictions (top row L->R, then bottom row L->R)
+  const preds = [];
+  for (let r = 0; r < 2; r++) {
+    for (let c = 0; c < 3; c++) preds.push({ r, c, cx: xCenters[c], cy: yCenters[r] });
+  }
+
+  // Assign candidate boxes to predictions (greedy by distance)
+  const assign = new Array(EXPECTED).fill(null);
+  const used = new Set();
+  const pairs = [];
+
+  for (let bi = 0; bi < boxes.length; bi++) {
+    const b = boxes[bi];
+    const bcX = b.x + b.w / 2;
+    const bcY = b.y + b.h / 2;
+
+    for (let pi = 0; pi < preds.length; pi++) {
+      const p = preds[pi];
+      const dist = Math.hypot(bcX - p.cx, bcY - p.cy);
+
+      // Only consider reasonably close assignments
+      if (dist <= Math.max(wMed, hMed) * 1.25) {
+        pairs.push({ dist, bi, pi });
+      }
+    }
+  }
+
+  pairs.sort((a, b) => a.dist - b.dist);
+  for (const pr of pairs) {
+    if (assign[pr.pi]) continue;
+    if (used.has(pr.bi)) continue;
+    assign[pr.pi] = boxes[pr.bi];
+    used.add(pr.bi);
+  }
+
+  // For missing predictions, run a local search around the predicted center.
+  for (let pi = 0; pi < assign.length; pi++) {
+    if (assign[pi]) continue;
+    const p = preds[pi];
+    const found = detectBottleNear(cv, bgr, p.cx, p.cy, wMed, hMed);
+    if (found) assign[pi] = found;
+  }
+
+  // Still missing? Fall back to a synthetic box with median size.
+  for (let pi = 0; pi < assign.length; pi++) {
+    if (assign[pi]) continue;
+    const p = preds[pi];
+    assign[pi] = {
+      x: clampInt(Math.round(p.cx - wMed / 2), 0, W - 1),
+      y: clampInt(Math.round(p.cy - hMed / 2), 0, H - 1),
+      w: clampInt(Math.round(wMed), 1, W),
+      h: clampInt(Math.round(hMed), 1, H),
+      area: wMed * hMed,
+    };
+  }
+
+  // Ensure stable ordering / integer coords
+  return assign.map((b) => ({
+    x: clampInt(Math.round(b.x), 0, W - 1),
+    y: clampInt(Math.round(b.y), 0, H - 1),
+    w: clampInt(Math.round(b.w), 1, W),
+    h: clampInt(Math.round(b.h), 1, H),
+  }));
+}
+
+function detectBottlesRobust(cv, bgr) {
+  // Multi-pass outline thresholding + fixed-grid normalization.
+  const W = bgr.cols, H = bgr.rows;
+
+  // Coarse ROI (exclude the side curtains + bottom UI). If the crop is too aggressive for a
+  // particular screenshot, the fixed-grid step below will still recover missing bottles.
+  const rx = clampInt(Math.round(W * 0.14), 0, W - 1);
+  const ry = clampInt(Math.round(H * 0.12), 0, H - 1);
+  const rw = clampInt(Math.round(W * 0.72), 1, W - rx);
+  const rh = clampInt(Math.round(H * 0.73), 1, H - ry);
+
+  const roiMat = bgr.roi(new cv.Rect(rx, ry, rw, rh));
+
+  const det = maybeDownscaleForDetection(cv, roiMat, 900);
+  const detScale = det.scale;
+  const detInv = 1.0 / detScale;
+
+  const area = det.mat.cols * det.mat.rows;
+  const minAreaScaled = Math.max(8000, area * 0.008);
+
+  const passes = [
+    { lower: [85, 18, 80], upper: [140, 255, 255] }, // bright outline
+    { lower: [85, 5, 40], upper: [140, 255, 255] },  // dark outline (empty bottles)
+  ];
+
+  const all = [];
+  for (const p of passes) {
+    const res = detectBottles(cv, det.mat, p.lower, p.upper, {
+      minArea: minAreaScaled,
+      aspectMin: 2.0,
+      aspectMax: 6.5,
+      nmsIou: 0.35,
+    });
+    all.push(...res.boxes);
+  }
+
+  if (det.owns) det.mat.delete();
+  roiMat.delete();
+
+  // Merge duplicates across passes
+  const combinedSmall = nmsBoxes(all, 0.30);
+
+  // Scale back to full-res ROI coords and then offset to full image coords.
+  const scaled = (detScale === 1.0)
+    ? combinedSmall
+    : scaleBoxesToOriginal(combinedSmall, detInv, rw, rh);
+
+  const boxes = scaled.map((b) => ({
+    x: b.x + rx,
+    y: b.y + ry,
+    w: b.w,
+    h: b.h,
+    area: b.w * b.h,
+  }));
+
+  // Enforce the fixed 3x2 grid (prevents curtain false positives and fills missing empty bottles)
+  return enforceFixedBottleGrid(cv, bgr, boxes);
+}
+
 function detectRockBottles(cv, bgr, boxes) {
   // Rock bottles are indicated by a pile of light-colored rocks near the *base* of the bottle.
   // Depending on the screenshot, that pile can be slightly *inside* the bottle outline and/or
@@ -630,20 +959,114 @@ function clusterColorsDbscan(cv, samplesBgr, eps) {
 
     const count = idxs.length;
     let sb = 0, sg = 0, sr = 0;
+    let sL = 0, sA = 0, sB = 0;
     for (const i of idxs) {
       const [b, g, r] = samplesBgr[i];
       sb += b; sg += g; sr += r;
+      const [L, A, B] = labs[i];
+      sL += L; sA += A; sB += B;
     }
     const cb = sb / count, cg = sg / count, cr = sr / count;
+    const cL = sL / count, cA = sA / count, cB = sB / count;
     clusterInfo[k] = {
       id: k,
       count,
       center_bgr: [cb, cg, cr],
+      center_lab: [cL, cA, cB],
       center_hex: bgrToHex(cb, cg, cr),
     };
   }
 
   return { labels, clusterInfo };
+}
+
+
+function labDist3(a, b) {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  const dz = a[2] - b[2];
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function mergeClustersToExpectedCount(labelsIn, clusterInfoIn, capacity, dbscanEps) {
+  // If total filled slots is divisible by capacity, then each color must appear exactly `capacity` times.
+  // That lets us infer the expected number of colors. If DBSCAN over-splits (e.g. "Yellow 1" + "Yellow 2"),
+  // we greedily merge the closest clusters until the expected count is reached.
+  const labels = labelsIn.slice();
+  const clusterInfo = clusterInfoIn; // mutate in place (caller doesn't reuse the raw object)
+
+  const nSamples = labels.length;
+  const cap = (typeof capacity === 'number' && capacity > 0) ? capacity : null;
+  if (!cap || nSamples === 0) return { labels, clusterInfo, merges: [], expectedColors: null };
+  if (nSamples % cap !== 0) return { labels, clusterInfo, merges: [], expectedColors: null };
+
+  const expectedColors = nSamples / cap;
+  const merges = [];
+
+  const maxDist = Math.max(8.0, (typeof dbscanEps === 'number' ? dbscanEps : 16.0) * 1.2);
+
+  function mergeInto(keepId, dropId) {
+    // update labels
+    for (let i = 0; i < labels.length; i++) {
+      if (labels[i] === dropId) labels[i] = keepId;
+    }
+
+    const a = clusterInfo[keepId];
+    const b = clusterInfo[dropId];
+    if (!a || !b) return;
+
+    const tot = a.count + b.count;
+    const wA = a.count / tot;
+    const wB = b.count / tot;
+
+    const cb = a.center_bgr[0] * wA + b.center_bgr[0] * wB;
+    const cg = a.center_bgr[1] * wA + b.center_bgr[1] * wB;
+    const cr = a.center_bgr[2] * wA + b.center_bgr[2] * wB;
+
+    const cl = a.center_lab[0] * wA + b.center_lab[0] * wB;
+    const ca = a.center_lab[1] * wA + b.center_lab[1] * wB;
+    const cb2 = a.center_lab[2] * wA + b.center_lab[2] * wB;
+
+    a.count = tot;
+    a.center_bgr = [cb, cg, cr];
+    a.center_lab = [cl, ca, cb2];
+    a.center_hex = bgrToHex(cb, cg, cr);
+
+    delete clusterInfo[dropId];
+  }
+
+  while (Object.keys(clusterInfo).length > expectedColors) {
+    const ids = Object.keys(clusterInfo).map((k) => parseInt(k, 10)).sort((a, b) => a - b);
+
+    let best = null;
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const idA = ids[i];
+        const idB = ids[j];
+        const a = clusterInfo[idA];
+        const b = clusterInfo[idB];
+        if (!a || !b) continue;
+
+        // Two different real colors will each have ~capacity occurrences, so their sum would exceed capacity.
+        if (a.count + b.count > cap) continue;
+
+        const d = labDist3(a.center_lab, b.center_lab);
+        if (d > maxDist) continue;
+
+        const keep = Math.min(idA, idB);
+        const drop = Math.max(idA, idB);
+
+        if (!best || d < best.d) best = { keep, drop, d };
+      }
+    }
+
+    if (!best) break;
+
+    mergeInto(best.keep, best.drop);
+    merges.push(best);
+  }
+
+  return { labels, clusterInfo, merges, expectedColors };
 }
 
 function detectRedBadges(cv, bgr) {
@@ -709,38 +1132,20 @@ function detectRedBadges(cv, bgr) {
 function buildResult(cv, bgr, capacity, dbscanEps, debugSampling = false) {
   const tStart = nowMs();
 
-  // 1) bottles (detect on downscaled frame for speed, then scale boxes back up)
-  // Bottle outline is a blue/periwinkle glow. Some empty/rock bottles have a *darker* outline,
-  // so we keep the V threshold a bit lower than the default 120.
-  const outlineLower = [90, 20, 100];
-  const outlineUpper = [125, 255, 255];
+  
+// 1) bottles (robust fixed 3x2 grid)
+log('step: detect bottles');
+const tDetect0 = nowMs();
+const boxes = detectBottlesRobust(cv, bgr);
+const tDetect1 = nowMs();
 
-  const det = maybeDownscaleForDetection(cv, bgr, 900);
-  const detScale = det.scale;
-  const detInv = 1.0 / detScale;
+log(`step: bottles found = ${boxes.length}`);
 
-  log(`step: detect bottles on ${det.mat.cols}×${det.mat.rows} (scale=${detScale.toFixed(3)})`);
+if (!boxes || boxes.length === 0) {
+  throw new Error('No bottles detected (outline HSV thresholds likely need tuning).');
+}
 
-  const minAreaScaled = 40000 * detScale * detScale;
-  const tDetect0 = nowMs();
-  const { boxes: boxesSmall } = detectBottles(cv, det.mat, outlineLower, outlineUpper, {
-    minArea: minAreaScaled,
-  });
-  const tDetect1 = nowMs();
-
-  if (det.owns) det.mat.delete();
-
-  const boxes = (detScale === 1.0)
-    ? boxesSmall
-    : scaleBoxesToOriginal(boxesSmall, detInv, bgr.cols, bgr.rows);
-
-  log(`step: bottles found = ${boxes.length}`);
-
-  if (!boxes || boxes.length === 0) {
-    throw new Error('No bottles detected (outline HSV thresholds likely need tuning).');
-  }
-
-  // 2) rock
+// 2) rock
   log('step: detect rocks');
   const tRock0 = nowMs();
   const { flags: rockFlags, rockBoxes } = detectRockBottles(cv, bgr, boxes);
@@ -755,8 +1160,18 @@ function buildResult(cv, bgr, capacity, dbscanEps, debugSampling = false) {
   // 4) colors
   log('step: cluster colors');
   const tColors0 = nowMs();
-  const { labels, clusterInfo } = clusterColorsDbscan(cv, samplesBgr, dbscanEps);
+  const { labels: rawLabels, clusterInfo: clusterInfo0 } = clusterColorsDbscan(cv, samplesBgr, dbscanEps);
+  const clusters0 = Object.keys(clusterInfo0).length;
+
+  const merged = mergeClustersToExpectedCount(rawLabels, clusterInfo0, cap, dbscanEps);
+  const labels = merged.labels;
+  const clusterInfo = merged.clusterInfo;
+
   const tColors1 = nowMs();
+  const clusters1 = Object.keys(clusterInfo).length;
+  if (merged.merges.length) {
+    log(`step: merged ${merged.merges.length} cluster pair(s) (${clusters0}→${clusters1}, expected=${merged.expectedColors})`);
+  }
 
   // attach rock and color ids
   for (let bi = 0; bi < bottles.length; bi++) {
@@ -795,18 +1210,23 @@ function buildResult(cv, bgr, capacity, dbscanEps, debugSampling = false) {
   const badgeBoxes = detectRedBadges(cv, bgr);
   const tBadges1 = nowMs();
 
-  // layout rows: rebuild using y clustering on the final boxes list.
-  const medH = (() => {
-    const hs = boxes.map((b) => b.h).sort((a, b) => a - b);
-    return hs[Math.floor(hs.length / 2)] ?? 100;
-  })();
-  const rowEps = Math.max(40.0, medH * 0.60);
-  const rowStructs = clusterRowsByY(boxes, rowEps);
-  const layoutRows = rowStructs.map((row) => row.boxes.map((b) => boxes.indexOf(b)));
+  
+// layout rows: fixed 3x2 ordering (fallback to y-clustering if something goes off-rail)
+const layoutRows = (boxes.length === 6)
+  ? [[0, 1, 2], [3, 4, 5]]
+  : (() => {
+      const medH = (() => {
+        const hs = boxes.map((b) => b.h).sort((a, b) => a - b);
+        return hs[Math.floor(hs.length / 2)] ?? 100;
+      })();
+      const rowEps = Math.max(40.0, medH * 0.60);
+      const rowStructs = clusterRowsByY(boxes, rowEps);
+      return rowStructs.map((row) => row.boxes.map((b) => boxes.indexOf(b)));
+    })();
 
-  // Lightweight timing logs (visible in DevTools console)
+// Lightweight timing logs (visible in DevTools console)
   const tEnd = nowMs();
-  log(`timing: detect=${(tDetect1 - tDetect0).toFixed(1)}ms (scale=${detScale.toFixed(3)}) rock=${(tRock1 - tRock0).toFixed(1)}ms slots=${(tSlots1 - tSlots0).toFixed(1)}ms colors=${(tColors1 - tColors0).toFixed(1)}ms badges=${(tBadges1 - tBadges0).toFixed(1)}ms total=${(tEnd - tStart).toFixed(1)}ms`);
+  log(`timing: detect=${(tDetect1 - tDetect0).toFixed(1)}ms rock=${(tRock1 - tRock0).toFixed(1)}ms slots=${(tSlots1 - tSlots0).toFixed(1)}ms colors=${(tColors1 - tColors0).toFixed(1)}ms badges=${(tBadges1 - tBadges0).toFixed(1)}ms total=${(tEnd - tStart).toFixed(1)}ms`);
 
   // fill samplePoints color hex (for overlay)
   for (const p of samplePoints) {
@@ -853,6 +1273,16 @@ self.onmessage = async (e) => {
   const msg = e.data || {};
   if (msg.type !== 'analyze') return;
 
+  // Prevent accidental concurrent analyses (async/await can yield to the event loop).
+  const reqId = (typeof msg.requestId === 'number') ? msg.requestId : null;
+  if (isBusy) {
+    self.postMessage({ type: 'error', requestId: reqId, error: 'Worker is busy; please retry.' });
+    return;
+  }
+
+  isBusy = true;
+  currentRequestId = reqId;
+
   const { width, height, rgba, capacity, dbscanEps, cvVer } = msg;
 
   try {
@@ -881,8 +1311,12 @@ self.onmessage = async (e) => {
     rgbaMat.delete();
     bgr.delete();
 
-    self.postMessage({ type: 'result', result, debug });
+    self.postMessage({ type: 'result', requestId: currentRequestId, result, debug });
   } catch (err) {
-    self.postMessage({ type: 'error', error: err?.message || String(err) });
+    self.postMessage({ type: 'error', requestId: currentRequestId, error: err?.message || String(err) });
+  } finally {
+    isBusy = false;
+    currentRequestId = null;
   }
 };
+

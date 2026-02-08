@@ -21,6 +21,19 @@ header, footer{
   border-bottom:1px solid var(--border);
 }
 
+a:link {
+color: #e7edf7; 
+}
+a:visited {
+color: #9fb0c6;
+}
+a:hover {
+color: #ecf1f9;
+}
+a:active {
+color: #ffffff;
+}
+
 footer{border-top:1px solid var(--border); border-bottom:none;}
 
 h1{margin:0 0 6px 0; font-size:20px;}
@@ -150,6 +163,17 @@ canvas{
   border:1px solid var(--border);
   border-radius:10px;
   background:var(--panel2);
+  cursor:pointer;
+  user-select:none;
+}
+
+.legend .item.selected{
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.35);
+}
+.legend .item.selected .swatch{
+  outline: 2px solid rgba(255, 255, 255, 0.75);
+  outline-offset: 1px;
 }
 .legend .swatch{
   width:14px;
@@ -291,6 +315,10 @@ canvas{
 .slot{
   flex:1;
   border-top:3px solid #000;
+}
+
+.slot.selectedColor{
+  box-shadow: inset 0 0 0 3px rgba(255, 255, 255, 0.85);
 }
 .slot:first-child{border-top:none;}
 .slot.empty{background:transparent;}

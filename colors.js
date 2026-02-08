@@ -105,6 +105,54 @@ export function buildColorLabels(colorsById) {
   const rawNames = new Map();
   for (const id of ids) rawNames.set(id, guessColorName(colorsById[String(id)]));
 
+// Resolve the only two "legit" near-duplicate naming cases we expect in this game:
+//   - Blue vs Periwinkle
+//   - Green vs Lime
+// Everything else should ideally be unique; if not, we still fall back to numbering.
+const hsvById = new Map();
+for (const id of ids) {
+  const { r, g, b } = hexToRgb(colorsById[String(id)]);
+  hsvById.set(id, rgbToHsv(r, g, b));
+}
+
+const blueGroup = ids.filter((id) => {
+  const n = rawNames.get(id);
+  return n === 'Blue' || n === 'Periwinkle';
+});
+
+if (blueGroup.length >= 2) {
+  // Least saturated => Periwinkle, most saturated => Blue
+  blueGroup.sort((a, b) => (hsvById.get(a).s - hsvById.get(b).s) || (hsvById.get(b).v - hsvById.get(a).v));
+  const perId = blueGroup[0];
+  const blueId = blueGroup[blueGroup.length - 1];
+  rawNames.set(perId, 'Periwinkle');
+  rawNames.set(blueId, 'Blue');
+  for (let i = 1; i < blueGroup.length - 1; i++) {
+    const id = blueGroup[i];
+    const { s } = hsvById.get(id);
+    rawNames.set(id, s <= 0.55 ? 'Periwinkle' : 'Blue');
+  }
+}
+
+const greenGroup = ids.filter((id) => {
+  const n = rawNames.get(id);
+  return n === 'Green' || n === 'Lime';
+});
+
+if (greenGroup.length >= 2) {
+  // Brightest => Lime, darkest => Green
+  greenGroup.sort((a, b) => (hsvById.get(b).v - hsvById.get(a).v) || (hsvById.get(a).h - hsvById.get(b).h));
+  const limeId = greenGroup[0];
+  const greenId = greenGroup[greenGroup.length - 1];
+  rawNames.set(limeId, 'Lime');
+  rawNames.set(greenId, 'Green');
+  for (let i = 1; i < greenGroup.length - 1; i++) {
+    const id = greenGroup[i];
+    const { v } = hsvById.get(id);
+    rawNames.set(id, v >= 0.6 ? 'Lime' : 'Green');
+  }
+}
+
   // ensure uniqueness: if duplicates, append numbers
   const counts = new Map();
   for (const id of ids) {
